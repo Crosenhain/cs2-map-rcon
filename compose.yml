@@ -1,0 +1,17 @@
+---
+services:
+  cs2-map-rcon-server:
+    container_name: cs2-map-rcon-server
+    build: .
+    environment:
+      PORT: 16969
+    restart: unless-stopped
+    network_mode: host
+    secrets:
+      - steam_api_key
+      - rcon_targets
+secrets:
+  rcon_targets:
+    file: secrets/rcon_targets
+  steam_api_key:
+    file: secrets/steam_api_key
