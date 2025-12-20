@@ -20,11 +20,12 @@ A small server that fetches maps from Steam Workshop collections and lets you br
 
 The server reads configuration from environment variables or Docker secrets (files under `/run/secrets/`):
 
-| Name               | Env var         | File                         | Description                          |
-| ------------------ | --------------- | ---------------------------- | ------------------------------------ |
-| Steam API key      | `STEAM_API_KEY` | `/run/secrets/steam_api_key` | Your Steam Web API key               |
-| RCON targets       | —               | `/run/secrets/rcon_targets`  | Server definitions (see below)       |
-| Listen port        | `PORT`          | —                            | HTTP listen port (default: `8080`)   |
+| Name               | Env var         | File                         | Description                           |
+| ------------------ | --------------- | ---------------------------- | --------------------------------------|
+| Steam API key      | `STEAM_API_KEY` | `/run/secrets/steam_api_key` | Your Steam Web API key                |
+| RCON targets       | —               | `/run/secrets/rcon_targets`  | Server definitions (see below)        |
+| Listen port        | `PORT`          | —                            | HTTP listen port (default: `8080`)    |
+| Web Path           | `WEB_PATH`      | —                            | Path to serve content on (default: /) |
 
 ### RCON targets file
 

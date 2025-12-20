@@ -78,6 +78,7 @@ var (
 	steamAPIKey   = getSecret("STEAM_API_KEY", "/run/secrets/steam_api_key")
 	rconTargets   = loadRconTargetsFromFile("/run/secrets/rcon_targets")
 	refreshPeriod = 10 * time.Minute
+	webPath       = "/"
 )
 
 // Cache now maps CollectionID -> List of Maps
@@ -244,7 +245,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
     .tabs button.active { background-color: #4caf50; color: white; }
     .tabcontent { display: none; }
     .tabcontent.active { display: block; }
-    
+
     /* Status Box Styles */
     .status-box {
       background-color: #2a2a2a;
@@ -300,15 +301,15 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
       if (!box) return;
 
       try {
-        const res = await fetch('/api/status?target=' + encodeURIComponent(server));
+        const res = await fetch('api/status?target=' + encodeURIComponent(server));
         const data = await res.json();
-        
+
         if (!data.online) {
            box.innerHTML = '<div class="status-error">OFFLINE or Unreachable (' + (data.error || 'Unknown') + ')</div>';
            return;
         }
 
-        box.innerHTML = 
+        box.innerHTML =
           '<div class="status-details">' +
             '<div class="status-item">Host: <span>' + (data.hostname || 'Unknown') + '</span></div>' +
             '<div class="status-item">Map: <span>' + (data.map || 'Unknown') + '</span></div>' +
@@ -322,7 +323,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
     window.onload = function () {
       const last = localStorage.getItem('lastSelectedServer');
       const fallback = document.querySelector('.tabs button')?.id.replace('btn-', '') || '';
-      if (last && document.getElementById(last)) { showTab(last); } 
+      if (last && document.getElementById(last)) { showTab(last); }
       else if (fallback) { showTab(fallback); }
     };
   </script>
@@ -339,19 +340,19 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 {{range .Servers}}
 {{$srv := .}}
 <div id="{{$srv.Name}}" class="tabcontent">
-  
+
   <div id="status-{{$srv.Name}}" class="status-box">
     <div class="status-loading">Loading server status...</div>
   </div>
 
   <div class="bot-controls">
-  <form method="POST" action="/bots" style="display:inline;">
+  <form method="POST" action="bots" style="display:inline;">
     <input type="hidden" name="target" value="{{$srv.Name}}"/>
     <input type="hidden" name="action" value="kick"/>
     <button class="bot-button danger" type="submit">Kick All Bots</button>
   </form>
   {{range $q := quotas}}
-  <form method="POST" action="/bots" style="display:inline;">
+  <form method="POST" action="bots" style="display:inline;">
     <input type="hidden" name="target" value="{{$srv.Name}}"/>
     <input type="hidden" name="action" value="quota"/>
     <input type="hidden" name="quota" value="{{$q}}"/>
@@ -362,7 +363,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 
   <div class="grid">
     {{range $srv.Maps}}
-    <form method="POST" action="/rcon">
+    <form method="POST" action="rcon">
       <input type="hidden" name="mapid" value="{{.ID}}"/>
       <input type="hidden" name="target" value="{{$srv.Name}}"/>
       <button class="map-button" type="submit">{{.Title}}</button>
@@ -438,7 +439,7 @@ func rconHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, webPath, http.StatusSeeOther)
 }
 
 func botsHandler(w http.ResponseWriter, r *http.Request) {
@@ -483,15 +484,15 @@ func botsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, webPath, http.StatusSeeOther)
 }
 
 // Regex to parse 'status' output
 var (
 	reHostname    = regexp.MustCompile(`hostname\s*:\s*(.+)`)
-	reMap         = regexp.MustCompile(`(?m)^map\s*:\s*([\w\-\._]+)`) // Standard "map : name"
+	reMap         = regexp.MustCompile(`(?m)^map\s*:\s*([\w\-\._]+)`)                       // Standard "map : name"
 	reMapFallback = regexp.MustCompile(`loaded spawngroup\(\s*1\).+?\[\d+:\s*([\w\-\._]+)`) // Fallback for CS2 hibernation
-	rePlayers     = regexp.MustCompile(`players\s*:\s*(\d+\s+humans?,\s+\d+\s+bots?)`) // Captures just "0 humans, 0 bots"
+	rePlayers     = regexp.MustCompile(`players\s*:\s*(\d+\s+humans?,\s+\d+\s+bots?)`)      // Captures just "0 humans, 0 bots"
 )
 
 func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -524,7 +525,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status.Online = true
-	
+
 	// Parse Hostname
 	if m := reHostname.FindStringSubmatch(resp); len(m) > 1 {
 		status.Hostname = strings.TrimSpace(m[1])
@@ -600,16 +601,20 @@ func main() {
 	if len(rconTargets) == 0 {
 		log.Fatal("No RCON targets configured.")
 	}
+	// For serving it as a subdirectory
+	if os.Getenv("WEB_PATH") != "" {
+		webPath = os.Getenv("WEB_PATH")
+	}
 
 	go updater()
 
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/rcon", rconHandler)
-	http.HandleFunc("/bots", botsHandler)
-	
-	http.HandleFunc("/api/maps", apiMapsHandler)
-	http.HandleFunc("/api/load", apiLoadMapHandler)
-	http.HandleFunc("/api/status", apiStatusHandler) // New endpoint
+	http.HandleFunc(webPath, indexHandler)
+	http.HandleFunc(webPath+"rcon", rconHandler)
+	http.HandleFunc(webPath+"bots", botsHandler)
+
+	http.HandleFunc(webPath+"api/maps", apiMapsHandler)
+	http.HandleFunc(webPath+"api/load", apiLoadMapHandler)
+	http.HandleFunc(webPath+"api/status", apiStatusHandler) // New endpoint
 
 	port := os.Getenv("PORT")
 	if port == "" {
