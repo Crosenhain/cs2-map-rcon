@@ -1,0 +1,56 @@
+services:
+  traefik:
+    image: traefik:v3
+    container_name: traefik
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./config/:/etc/traefik/config/:ro
+    networks:
+      - proxy-net
+
+  tinyauth:
+    image: ghcr.io/steveiliop56/tinyauth:v4
+    container_name: tinyauth
+    restart: unless-stopped
+    networks:
+      - proxy-net
+    environment:
+      - "URL=https://cs2.example.com"  # The public URL of your app
+      # openssl rand -hex 16
+      - "SECRET=change_me_to_a_random_string"
+      # --- Provider Config (Example: Google) ---
+      # See TinyAuth docs for GitHub/OIDC/etc options
+      - "METHOD=google"
+      - "PROVIDERS_GOOGLE_CLIENT_ID=your-google-client-id"
+      - "PROVIDERS_GOOGLE_CLIENT_SECRET=your-google-client-secret"
+      # Restrict logins at the Auth layer
+      - "OAUTH_WHITELIST=admin@example.com,friend@gmail.com"
+
+  cs2-map-rcon-server:
+    image:  ghcr.io/crosenhain/cs2-rcon:latest
+    container_name: cs2-map-rcon-server
+    restart: unless-stopped
+    environment:
+      - PORT=16969
+    secrets:
+      - steam_api_key
+      - rcon_targets
+      - allowed_users
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
+    name: proxy-net
+
+secrets:
+  steam_api_key:
+    file: ./secrets/steam_api_key
+  rcon_targets:
+    file: ./secrets/rcon_targets.yaml
+  allowed_users:
+    file: ./secrets/allowed_users

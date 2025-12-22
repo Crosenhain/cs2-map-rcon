@@ -1,0 +1,48 @@
+# config/dynamic.yml
+http:
+  # --- ROUTERS ---
+  routers:
+    cs2-public:
+      rule: "Host(`cs2.example.com`)"
+      entryPoints: ["websecure"]
+      service: cs2-rcon-service
+      middlewares:
+        - "tinyauth-middleware" # Updated name
+      tls:
+        certResolver: myresolver
+
+    cs2-local:
+      rule: "Host(`cs2.example.com`) && ClientIP(`192.168.1.0/24`, `10.0.0.0/8`)"
+      entryPoints: ["websecure"]
+      service: cs2-rcon-service
+      priority: 100
+      middlewares:
+        - "local-bypass-headers"
+      tls:
+        certResolver: myresolver
+
+  # --- SERVICES ---
+  services:
+    cs2-rcon-service:
+      loadBalancer:
+        servers:
+          - url: "http://cs2-map-rcon-server:16969"
+
+  # --- MIDDLEWARES ---
+  middlewares:
+    # A. TinyAuth Middleware
+    tinyauth-middleware:
+      forwardAuth:
+        # Points to the container name defined in docker-compose
+        address: "http://tinyauth:80"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "X-Forwarded-User"
+          - "X-Forwarded-Email"
+
+    # B. Local Bypass Headers
+    local-bypass-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Email: "local-admin"
+          X-Forwarded-User: "Local Admin"
