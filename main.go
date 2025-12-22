@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goccy/go-yaml"
 	"github.com/gorcon/rcon"
 )
 
@@ -28,21 +29,26 @@ type MapInfo struct {
 	Title string
 }
 
+type ConfigFile struct {
+	Servers []TargetServer `yaml:"servers"`
+}
+
 type TargetServer struct {
-	Name         string
-	Address      string
-	Password     string
-	CollectionID string
+	Name         string `yaml:"name"`
+	Address      string `yaml:"address"`
+	Password     string `yaml:"password"`
+	CollectionID string `yaml:"collection_id"`
 }
 
 type ServerStatus struct {
 	Hostname string `json:"hostname"`
 	Map      string `json:"map"`
-	Players  string `json:"players"` // "X humans, Y bots"
+	Players  string `json:"players"`
 	Online   bool   `json:"online"`
 	Error    string `json:"error,omitempty"`
 }
 
+// Steam API Response Structs
 type FileDetailsResponse struct {
 	Response struct {
 		PublishedFileDetails []struct {
@@ -62,8 +68,8 @@ type ItemDetailsResponse struct {
 	} `json:"response"`
 }
 
-// PageData is passed to the HTML template
 type PageData struct {
+	User    string
 	Servers []ServerViewData
 }
 
@@ -74,14 +80,18 @@ type ServerViewData struct {
 
 // --- Globals ---
 
+type contextKey string
+
+const userKey contextKey = "user"
+
 var (
 	steamAPIKey   = getSecret("STEAM_API_KEY", "/run/secrets/steam_api_key")
-	rconTargets   = loadRconTargetsFromFile("/run/secrets/rcon_targets")
+	rconTargets   = loadRconTargetsFromYAML("/run/secrets/rcon_targets")
+	allowedUsers  = loadAllowedUsers("/run/secrets/allowed_users", "ALLOWED_USERS")
 	refreshPeriod = 10 * time.Minute
 	webPath       = "/"
 )
 
-// Cache now maps CollectionID -> List of Maps
 var cache = struct {
 	sync.RWMutex
 	collections map[string][]MapInfo
@@ -93,42 +103,58 @@ func getSecret(envKey, filePath string) string {
 	if v := os.Getenv(envKey); v != "" {
 		return v
 	}
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-func loadRconTargetsFromFile(path string) map[string]TargetServer {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Printf("Error opening RCON targets file: %v", err)
-		return map[string]TargetServer{}
+func loadAllowedUsers(filePath, envKey string) map[string]bool {
+	users := make(map[string]bool)
+	var raw string
+	data, err := os.ReadFile(filePath)
+	if err == nil {
+		raw = string(data)
+	} else {
+		raw = os.Getenv(envKey)
 	}
-	defer file.Close()
 
-	targets := make(map[string]TargetServer)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			parts := strings.SplitN(line, "=", 4)
-			if len(parts) == 4 {
-				name := strings.TrimSpace(parts[0])
-				targets[name] = TargetServer{
-					Name:         name,
-					Address:      strings.TrimSpace(parts[1]),
-					Password:     strings.TrimSpace(parts[2]),
-					CollectionID: strings.TrimSpace(parts[3]),
-				}
-			} else {
-				log.Printf("Skipping invalid config line: %s", line)
-			}
+	if raw == "" {
+		log.Println("WARNING: No allowed users configured. Check /run/secrets/allowed_users or ALLOWED_USERS env.")
+		return users
+	}
+
+	normalized := strings.ReplaceAll(raw, ",", " ")
+	parts := strings.Fields(normalized)
+
+	for _, u := range parts {
+		trimmed := strings.TrimSpace(u)
+		if trimmed != "" {
+			users[trimmed] = true
 		}
+	}
+	return users
+}
+
+func loadRconTargetsFromYAML(path string) map[string]TargetServer {
+	targets := make(map[string]TargetServer)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("Error opening config file: %v", err)
+		return targets
+	}
+	var cfg ConfigFile
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("Error parsing YAML config: %v", err)
+	}
+	for _, s := range cfg.Servers {
+		targets[s.Name] = s
 	}
 	return targets
 }
+
+// --- Steam API Helpers ---
 
 func fetchCollection(colID string) ([]string, error) {
 	form := url.Values{}
@@ -138,9 +164,13 @@ func fetchCollection(colID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body (fetchCollection): %v", err)
+		}
+	}()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %v", err)
 	}
@@ -170,9 +200,13 @@ func fetchDetails(ids []string) ([]MapInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body (fetchDetails): %v", err)
+		}
+	}()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %v", err)
 	}
@@ -226,6 +260,31 @@ func runUpdate() {
 	log.Println("Map cache updated")
 }
 
+// --- Authentication Middleware ---
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userEmail := r.Header.Get("X-Forwarded-Email")
+		if userEmail == "" {
+			userEmail = r.Header.Get("X-Forwarded-User")
+		}
+
+		if userEmail == "" {
+			http.Error(w, "Unauthorized: No user identity found", http.StatusUnauthorized)
+			return
+		}
+
+		if !allowedUsers[userEmail] {
+			log.Printf("[AUTH FAIL] User %s attempted access", userEmail)
+			http.Error(w, "Forbidden: You do not have access", http.StatusForbidden)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userKey, userEmail)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
 // --- HTML Template ---
 
 var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
@@ -240,31 +299,17 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
   <style>
     body { background-color: #1e1e1e; color: #f0f0f0; font-family: Arial, sans-serif; padding: 2rem; }
     h1 { text-align: center; }
+    .user-info { text-align: center; color: #888; margin-bottom: 1.5rem; font-size: 0.9rem; }
     .tabs { display: flex; justify-content: center; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
     .tabs button { padding: 0.75rem 1.5rem; background-color: #333; color: #fff; border: none; cursor: pointer; border-radius: 5px; }
     .tabs button.active { background-color: #4caf50; color: white; }
     .tabcontent { display: none; }
     .tabcontent.active { display: block; }
-
-    /* Status Box Styles */
-    .status-box {
-      background-color: #2a2a2a;
-      border: 1px solid #444;
-      border-radius: 8px;
-      padding: 1rem;
-      margin-bottom: 1.5rem;
-      text-align: center;
-      min-height: 80px;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-    }
+    .status-box { background-color: #2a2a2a; border: 1px solid #444; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; text-align: center; min-height: 80px; display: flex; flex-direction: column; justify-content: center; align-items: center; }
     .status-loading { color: #888; font-style: italic; }
     .status-error { color: #ff6b6b; }
     .status-details { display: flex; gap: 2rem; flex-wrap: wrap; justify-content: center; }
     .status-item span { font-weight: bold; color: #4caf50; }
-
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-top: 2rem; }
     .grid form { display: flex; justify-content: center; }
     button.map-button { background-color: #333; color: #fff; border: 2px solid #555; border-radius: 10px; padding: 1rem; width: 100%; font-size: 1.1rem; cursor: pointer; transition: all 0.2s ease-in-out; }
@@ -277,38 +322,29 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
   </style>
   <script>
     let pollInterval = null;
-
     function showTab(server) {
-      // UI switching
       document.querySelectorAll('.tabcontent').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.tabs button').forEach(el => el.classList.remove('active'));
       document.getElementById(server).classList.add('active');
       document.getElementById('btn-' + server).classList.add('active');
       localStorage.setItem('lastSelectedServer', server);
-
-      // Start Polling
       startPolling(server);
     }
-
     function startPolling(server) {
       if (pollInterval) clearInterval(pollInterval);
-      fetchStatus(server); // immediate fetch
-      pollInterval = setInterval(() => fetchStatus(server), 5000); // 5s interval
+      fetchStatus(server);
+      pollInterval = setInterval(() => fetchStatus(server), 5000);
     }
-
     async function fetchStatus(server) {
       const box = document.getElementById('status-' + server);
       if (!box) return;
-
       try {
         const res = await fetch('api/status?target=' + encodeURIComponent(server));
         const data = await res.json();
-
         if (!data.online) {
            box.innerHTML = '<div class="status-error">OFFLINE or Unreachable (' + (data.error || 'Unknown') + ')</div>';
            return;
         }
-
         box.innerHTML =
           '<div class="status-details">' +
             '<div class="status-item">Host: <span>' + (data.hostname || 'Unknown') + '</span></div>' +
@@ -319,7 +355,6 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
         box.innerHTML = '<div class="status-error">Error fetching status</div>';
       }
     }
-
     window.onload = function () {
       const last = localStorage.getItem('lastSelectedServer');
       const fallback = document.querySelector('.tabs button')?.id.replace('btn-', '') || '';
@@ -330,6 +365,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 </head>
 <body>
 <h1>CS2 RCON</h1>
+<div class="user-info">Logged in as: <strong>{{.User}}</strong></div>
 
 <div class="tabs">
   {{range .Servers}}
@@ -340,7 +376,6 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 {{range .Servers}}
 {{$srv := .}}
 <div id="{{$srv.Name}}" class="tabcontent">
-
   <div id="status-{{$srv.Name}}" class="status-box">
     <div class="status-loading">Loading server status...</div>
   </div>
@@ -381,6 +416,8 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 // --- Handlers ---
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
+	currentUser := r.Context().Value(userKey).(string)
+
 	cache.RLock()
 	collections := cache.collections
 	cache.RUnlock()
@@ -398,8 +435,13 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		serverViews = append(serverViews, ServerViewData{Name: name, Maps: maps})
 	}
 
+	data := PageData{
+		User:    currentUser,
+		Servers: serverViews,
+	}
+
 	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, PageData{Servers: serverViews}); err != nil {
+	if err := tpl.Execute(&buf, data); err != nil {
 		log.Println("Template execute error:", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
@@ -410,6 +452,8 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func rconHandler(w http.ResponseWriter, r *http.Request) {
+	currentUser := r.Context().Value(userKey).(string)
+
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -420,19 +464,27 @@ func rconHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	rconConn, err := rcon.Dial(target.Address, target.Password)
-	if err != nil {
-		log.Println("RCON dial error:", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer rconConn.Close()
 
 	mapID := r.FormValue("mapid")
 	if _, err := strconv.ParseUint(mapID, 10, 64); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[AUDIT] User %s changing map on %s to ID %s", currentUser, targetName, mapID)
+
+	rconConn, err := rcon.Dial(target.Address, target.Password)
+	if err != nil {
+		log.Println("RCON dial error:", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		if err := rconConn.Close(); err != nil {
+			log.Printf("Error closing RCON connection (rconHandler): %v", err)
+		}
+	}()
+
 	cmd := fmt.Sprintf("host_workshop_map %s", mapID)
 	if _, err := rconConn.Execute(cmd); err != nil {
 		log.Println("RCON exec error:", err)
@@ -443,6 +495,8 @@ func rconHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func botsHandler(w http.ResponseWriter, r *http.Request) {
+	currentUser := r.Context().Value(userKey).(string)
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -453,15 +507,22 @@ func botsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unknown RCON target", http.StatusBadRequest)
 		return
 	}
+
+	action := r.FormValue("action")
+	log.Printf("[AUDIT] User %s performed bot action '%s' on %s", currentUser, action, targetName)
+
 	conn, err := rcon.Dial(target.Address, target.Password)
 	if err != nil {
 		log.Printf("botsHandler dial error: %v", err)
 		http.Error(w, "RCON connection failed", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing RCON connection (botsHandler): %v", err)
+		}
+	}()
 
-	action := r.FormValue("action")
 	switch action {
 	case "kick":
 		if _, err := conn.Execute("bot_quota 0"); err != nil {
@@ -487,12 +548,11 @@ func botsHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, webPath, http.StatusSeeOther)
 }
 
-// Regex to parse 'status' output
 var (
 	reHostname    = regexp.MustCompile(`hostname\s*:\s*(.+)`)
-	reMap         = regexp.MustCompile(`(?m)^map\s*:\s*([\w\-\._]+)`)                       // Standard "map : name"
-	reMapFallback = regexp.MustCompile(`loaded spawngroup\(\s*1\).+?\[\d+:\s*([\w\-\._]+)`) // Fallback for CS2 hibernation
-	rePlayers     = regexp.MustCompile(`players\s*:\s*(\d+\s+humans?,\s+\d+\s+bots?)`)      // Captures just "0 humans, 0 bots"
+	reMap         = regexp.MustCompile(`(?m)^map\s*:\s*([\w\-\._]+)`)
+	reMapFallback = regexp.MustCompile(`loaded spawngroup\(\s*1\).+?\[\d+:\s*([\w\-\._]+)`)
+	rePlayers     = regexp.MustCompile(`players\s*:\s*(\d+\s+humans?,\s+\d+\s+bots?)`)
 )
 
 func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -512,26 +572,30 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := rcon.Dial(target.Address, target.Password)
 	if err != nil {
 		status.Error = "Connection failed"
-		json.NewEncoder(w).Encode(status)
+		if encErr := json.NewEncoder(w).Encode(status); encErr != nil {
+			log.Printf("JSON encode error (conn fail): %v", encErr)
+		}
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing RCON connection (apiStatusHandler): %v", err)
+		}
+	}()
 
 	resp, err := conn.Execute("status")
 	if err != nil {
 		status.Error = "Command failed"
-		json.NewEncoder(w).Encode(status)
+		if encErr := json.NewEncoder(w).Encode(status); encErr != nil {
+			log.Printf("JSON encode error (cmd fail): %v", encErr)
+		}
 		return
 	}
 
 	status.Online = true
-
-	// Parse Hostname
 	if m := reHostname.FindStringSubmatch(resp); len(m) > 1 {
 		status.Hostname = strings.TrimSpace(m[1])
 	}
-
-	// Parse Map (Try standard first, then fallback)
 	if m := reMap.FindStringSubmatch(resp); len(m) > 1 {
 		status.Map = strings.TrimSpace(m[1])
 	} else if m := reMapFallback.FindStringSubmatch(resp); len(m) > 1 {
@@ -539,14 +603,14 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		status.Map = "Unknown"
 	}
-
-	// Parse Players
 	if m := rePlayers.FindStringSubmatch(resp); len(m) > 1 {
 		status.Players = strings.TrimSpace(m[1])
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		log.Printf("JSON encode error (success): %v", err)
+	}
 }
 
 func apiMapsHandler(w http.ResponseWriter, r *http.Request) {
@@ -554,10 +618,14 @@ func apiMapsHandler(w http.ResponseWriter, r *http.Request) {
 	cols := cache.collections
 	cache.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(cols)
+	if err := json.NewEncoder(w).Encode(cols); err != nil {
+		log.Printf("JSON encode error (apiMapsHandler): %v", err)
+	}
 }
 
 func apiLoadMapHandler(w http.ResponseWriter, r *http.Request) {
+	currentUser := r.Context().Value(userKey).(string)
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -579,19 +647,29 @@ func apiLoadMapHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid map_id", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[AUDIT] User %s triggered API map load on %s (ID: %s)", currentUser, req.Server, req.MapID)
+
 	conn, err := rcon.Dial(target.Address, target.Password)
 	if err != nil {
 		http.Error(w, "RCON connection failed", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing RCON connection (apiLoadMapHandler): %v", err)
+		}
+	}()
+
 	cmd := fmt.Sprintf("host_workshop_map %s", req.MapID)
 	if _, err := conn.Execute(cmd); err != nil {
 		http.Error(w, "RCON execution failed", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"status":"ok"}`)
+	if _, err := fmt.Fprint(w, `{"status":"ok"}`); err != nil {
+		log.Printf("Error writing response (apiLoadMapHandler): %v", err)
+	}
 }
 
 func main() {
@@ -599,22 +677,24 @@ func main() {
 		log.Fatal("Missing STEAM_API_KEY secret.")
 	}
 	if len(rconTargets) == 0 {
-		log.Fatal("No RCON targets configured.")
+		log.Fatal("No RCON targets configured. Check your YAML secret.")
 	}
-	// For serving it as a subdirectory
+	if len(allowedUsers) == 0 {
+		log.Println("CRITICAL WARNING: No allowed users configured. Site will be inaccessible.")
+	}
+
 	if os.Getenv("WEB_PATH") != "" {
 		webPath = os.Getenv("WEB_PATH")
 	}
 
 	go updater()
 
-	http.HandleFunc(webPath, indexHandler)
-	http.HandleFunc(webPath+"rcon", rconHandler)
-	http.HandleFunc(webPath+"bots", botsHandler)
-
-	http.HandleFunc(webPath+"api/maps", apiMapsHandler)
-	http.HandleFunc(webPath+"api/load", apiLoadMapHandler)
-	http.HandleFunc(webPath+"api/status", apiStatusHandler) // New endpoint
+	http.HandleFunc(webPath, authMiddleware(indexHandler))
+	http.HandleFunc(webPath+"rcon", authMiddleware(rconHandler))
+	http.HandleFunc(webPath+"bots", authMiddleware(botsHandler))
+	http.HandleFunc(webPath+"api/maps", authMiddleware(apiMapsHandler))
+	http.HandleFunc(webPath+"api/load", authMiddleware(apiLoadMapHandler))
+	http.HandleFunc(webPath+"api/status", authMiddleware(apiStatusHandler))
 
 	port := os.Getenv("PORT")
 	if port == "" {

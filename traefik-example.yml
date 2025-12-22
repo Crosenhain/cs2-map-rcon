@@ -1,0 +1,23 @@
+# traefik.yml
+entryPoints:
+  web:
+    address: ":80"
+    # Redirect HTTP to HTTPS
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    # TRUSTED IPS: Required for ClientIP matching if you are behind Cloudflare/AWS ALB
+    # forwardedHeaders:
+    #   trustedIPs: ["1.2.3.4", "10.0.0.0/8"]
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false  # Good practice: don't expose containers automatically
+  file:
+    directory: "/etc/traefik/config"
+    watch: true              # Hot-reload changes automatically

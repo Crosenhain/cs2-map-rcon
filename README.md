@@ -29,10 +29,28 @@ The server reads configuration from environment variables or Docker secrets (fil
 
 ### RCON targets file
 
-Create a file at `secrets/rcon_targets` (or mount your own path).
-**Format:** `<Name>=<IP:Port>=<RCON Password>=<Collection ID>`
+Create a file at `secrets/rcon_targets.yaml` (or mount your own path).
+
+**Example:**
+```yaml
+servers:
+  - name: "MainServer"
+    address: "192.168.1.10:27015"
+    password: "supersecret"
+    collection_id: "123456789"
+  - name: "RetakeServer"
+    address: "192.168.1.10:27025"
+    password: "anotherpassword"
+    collection_id: "987654321"
+```
+
+### OAuth allowed users
+
+Create a file at `secrets/allowed_users` (or mount your own path).
 
 **Example:**
 ```text
-MainServer=192.168.1.10:27015=supersecret=123456789
-Retakes=192.168.1.10:27016=adminpass=987654321
+admin@example.com
+friend@gmail.com
+local-admin
+```
