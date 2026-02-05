@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -68,8 +68,9 @@ type PageData struct {
 }
 
 type ServerViewData struct {
-	Name string
-	Maps []MapInfo
+	Name         string
+	Maps         []MapInfo
+	OfficialMaps []MapInfo
 }
 
 // --- Globals ---
@@ -79,13 +80,18 @@ var (
 	rconTargets   = loadRconTargetsFromFile("/run/secrets/rcon_targets")
 	refreshPeriod = 10 * time.Minute
 	webPath       = "/"
+	debugMode     = strings.ToLower(os.Getenv("DEBUG")) == "true"
 )
 
 // Cache now maps CollectionID -> List of Maps
 var cache = struct {
 	sync.RWMutex
-	collections map[string][]MapInfo
-}{collections: make(map[string][]MapInfo)}
+	collections   map[string][]MapInfo
+	installedMaps map[string][]MapInfo // ServerName -> List of Maps
+}{
+	collections:   make(map[string][]MapInfo),
+	installedMaps: make(map[string][]MapInfo),
+}
 
 // --- Helpers ---
 
@@ -93,7 +99,7 @@ func getSecret(envKey, filePath string) string {
 	if v := os.Getenv(envKey); v != "" {
 		return v
 	}
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ""
 	}
@@ -106,7 +112,7 @@ func loadRconTargetsFromFile(path string) map[string]TargetServer {
 		log.Printf("Error opening RCON targets file: %v", err)
 		return map[string]TargetServer{}
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	targets := make(map[string]TargetServer)
 	scanner := bufio.NewScanner(file)
@@ -130,6 +136,74 @@ func loadRconTargetsFromFile(path string) map[string]TargetServer {
 	return targets
 }
 
+func fetchInstalledMaps(target TargetServer) ([]MapInfo, error) {
+	if debugMode {
+		log.Printf("[DEBUG] Dialing RCON for %s at %s...", target.Name, target.Address)
+	}
+	conn, err := rcon.Dial(target.Address, target.Password)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	resp, err := conn.Execute("maps *")
+	if err != nil {
+		return nil, err
+	}
+
+	if debugMode {
+		log.Printf("[DEBUG] 'maps *' response from %s:\n%s", target.Name, resp)
+	}
+
+	var maps []MapInfo
+	seen := make(map[string]bool)
+	scanner := bufio.NewScanner(strings.NewReader(resp))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "---") || strings.Contains(line, " maps") {
+			continue
+		}
+
+		// Split into words to handle potential prefixes like "PENDING:" or "(fs)"
+		words := strings.Fields(line)
+		for _, w := range words {
+			mapName := w
+			// Strip .vpk if present
+			if strings.HasSuffix(strings.ToLower(w), ".vpk") {
+				mapName = w[:len(w)-4]
+			}
+
+			// Filter out paths (editor/, ui/, prefabs/, etc.) and vanity/background maps
+			if strings.Contains(mapName, "/") || strings.Contains(mapName, "\\") ||
+				strings.HasSuffix(mapName, "_vanity") || strings.HasSuffix(mapName, "_skybox") ||
+				strings.HasPrefix(mapName, "workshop_preview_") ||
+				mapName == "error" || mapName == "graphics_settings" || mapName == "lobby_mapveto" {
+				if debugMode {
+					log.Printf("[DEBUG] Skipping internal or vanity map: %s", mapName)
+				}
+				continue
+			}
+
+			// Basic validation: must match expected map name pattern
+			if isValidMapName(mapName) && !seen[mapName] {
+				maps = append(maps, MapInfo{ID: mapName, Title: mapName})
+				seen[mapName] = true
+				if debugMode {
+					log.Printf("[DEBUG] Added map: %s", mapName)
+				}
+			}
+		}
+	}
+
+	// Sort maps alphabetically
+	sort.Slice(maps, func(i, j int) bool {
+		return maps[i].Title < maps[j].Title
+	})
+
+	return maps, nil
+}
+
 func fetchCollection(colID string) ([]string, error) {
 	form := url.Values{}
 	form.Set("collectioncount", "1")
@@ -138,9 +212,9 @@ func fetchCollection(colID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %v", err)
 	}
@@ -170,9 +244,9 @@ func fetchDetails(ids []string) ([]MapInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %v", err)
 	}
@@ -184,7 +258,7 @@ func fetchDetails(ids []string) ([]MapInfo, error) {
 	for _, d := range det.Response.PublishedFileDetails {
 		title := d.Title
 		if title == "" {
-			title = "[No Title]"
+			title = fmt.Sprintf("[No Title] (%s)", d.PublishedFileID)
 		}
 		out = append(out, MapInfo{ID: d.PublishedFileID, Title: title})
 	}
@@ -200,6 +274,9 @@ func updater() {
 }
 
 func runUpdate() {
+	if debugMode {
+		log.Println("[DEBUG] Starting map update...")
+	}
 	uniqueIDs := make(map[string]bool)
 	for _, target := range rconTargets {
 		if target.CollectionID != "" {
@@ -220,8 +297,20 @@ func runUpdate() {
 		}
 		tempCache[colID] = maps
 	}
+
+	tempInstalledMaps := make(map[string][]MapInfo)
+	for name, target := range rconTargets {
+		installed, err := fetchInstalledMaps(target)
+		if err != nil {
+			log.Printf("Error fetching installed maps for %s: %v", name, err)
+			continue
+		}
+		tempInstalledMaps[name] = installed
+	}
+
 	cache.Lock()
 	cache.collections = tempCache
+	cache.installedMaps = tempInstalledMaps
 	cache.Unlock()
 	log.Println("Map cache updated")
 }
@@ -361,6 +450,20 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
   {{end}}
 </div>
 
+  <h3>Official Maps</h3>
+  <div class="grid">
+    {{range $srv.OfficialMaps}}
+    <form method="POST" action="rcon">
+      <input type="hidden" name="mapid" value="{{.ID}}"/>
+      <input type="hidden" name="target" value="{{$srv.Name}}"/>
+      <button class="map-button" type="submit">{{.Title}}</button>
+    </form>
+    {{else}}
+    <p style="text-align:center; grid-column: 1 / -1;">No official maps found (or RCON failed).</p>
+    {{end}}
+  </div>
+
+  <h3>Workshop Maps</h3>
   <div class="grid">
     {{range $srv.Maps}}
     <form method="POST" action="rcon">
@@ -369,7 +472,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
       <button class="map-button" type="submit">{{.Title}}</button>
     </form>
     {{else}}
-    <p style="text-align:center;">No maps found for this collection.</p>
+    <p style="text-align:center; grid-column: 1 / -1;">No maps found for this collection.</p>
     {{end}}
   </div>
 </div>
@@ -383,6 +486,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	cache.RLock()
 	collections := cache.collections
+	installed := cache.installedMaps
 	cache.RUnlock()
 
 	var serverViews []ServerViewData
@@ -395,7 +499,12 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	for _, name := range keys {
 		target := rconTargets[name]
 		maps := collections[target.CollectionID]
-		serverViews = append(serverViews, ServerViewData{Name: name, Maps: maps})
+		official := installed[name]
+		serverViews = append(serverViews, ServerViewData{
+			Name:         name,
+			Maps:         maps,
+			OfficialMaps: official,
+		})
 	}
 
 	var buf bytes.Buffer
@@ -426,20 +535,32 @@ func rconHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer rconConn.Close()
+	defer func() { _ = rconConn.Close() }()
 
 	mapID := r.FormValue("mapid")
-	if _, err := strconv.ParseUint(mapID, 10, 64); err != nil {
+	var cmd string
+	// Check if mapID is numeric (Workshop ID)
+	if _, err := strconv.ParseUint(mapID, 10, 64); err == nil {
+		cmd = fmt.Sprintf("host_workshop_map %s", mapID)
+	} else if isValidMapName(mapID) {
+		// Assume it's a standard map name
+		cmd = fmt.Sprintf("map %s", mapID)
+	} else {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cmd := fmt.Sprintf("host_workshop_map %s", mapID)
+
 	if _, err := rconConn.Execute(cmd); err != nil {
 		log.Println("RCON exec error:", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, webPath, http.StatusSeeOther)
+}
+
+func isValidMapName(name string) bool {
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_\-]+$`, name)
+	return matched
 }
 
 func botsHandler(w http.ResponseWriter, r *http.Request) {
@@ -459,7 +580,7 @@ func botsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "RCON connection failed", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	action := r.FormValue("action")
 	switch action {
@@ -512,15 +633,15 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := rcon.Dial(target.Address, target.Password)
 	if err != nil {
 		status.Error = "Connection failed"
-		json.NewEncoder(w).Encode(status)
+		_ = json.NewEncoder(w).Encode(status)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp, err := conn.Execute("status")
 	if err != nil {
 		status.Error = "Command failed"
-		json.NewEncoder(w).Encode(status)
+		_ = json.NewEncoder(w).Encode(status)
 		return
 	}
 
@@ -546,7 +667,7 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func apiMapsHandler(w http.ResponseWriter, r *http.Request) {
@@ -554,7 +675,7 @@ func apiMapsHandler(w http.ResponseWriter, r *http.Request) {
 	cols := cache.collections
 	cache.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(cols)
+	_ = json.NewEncoder(w).Encode(cols)
 }
 
 func apiLoadMapHandler(w http.ResponseWriter, r *http.Request) {
@@ -575,23 +696,30 @@ func apiLoadMapHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unknown server", http.StatusBadRequest)
 		return
 	}
-	if _, err := strconv.ParseUint(req.MapID, 10, 64); err != nil {
+
+	var cmd string
+	if _, err := strconv.ParseUint(req.MapID, 10, 64); err == nil {
+		cmd = fmt.Sprintf("host_workshop_map %s", req.MapID)
+	} else if isValidMapName(req.MapID) {
+		cmd = fmt.Sprintf("map %s", req.MapID)
+	} else {
 		http.Error(w, "Invalid map_id", http.StatusBadRequest)
 		return
 	}
+
 	conn, err := rcon.Dial(target.Address, target.Password)
 	if err != nil {
 		http.Error(w, "RCON connection failed", http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
-	cmd := fmt.Sprintf("host_workshop_map %s", req.MapID)
+	defer func() { _ = conn.Close() }()
+
 	if _, err := conn.Execute(cmd); err != nil {
 		http.Error(w, "RCON execution failed", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"status":"ok"}`)
+	_, _ = fmt.Fprint(w, `{"status":"ok"}`)
 }
 
 func main() {
@@ -601,6 +729,9 @@ func main() {
 	if len(rconTargets) == 0 {
 		log.Fatal("No RCON targets configured.")
 	}
+
+	log.Printf("Starting CS2 Map RCON. Debug Mode: %v", debugMode)
+
 	// For serving it as a subdirectory
 	if os.Getenv("WEB_PATH") != "" {
 		webPath = os.Getenv("WEB_PATH")
@@ -614,7 +745,7 @@ func main() {
 
 	http.HandleFunc(webPath+"api/maps", apiMapsHandler)
 	http.HandleFunc(webPath+"api/load", apiLoadMapHandler)
-	http.HandleFunc(webPath+"api/status", apiStatusHandler) // New endpoint
+	http.HandleFunc(webPath+"api/status", apiStatusHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
