@@ -5,6 +5,7 @@ services:
     build: .
     environment:
       PORT: 16969
+      #DEBUG: true
     restart: unless-stopped
     network_mode: host
     secrets:
