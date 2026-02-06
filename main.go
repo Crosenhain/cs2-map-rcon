@@ -146,6 +146,18 @@ func fetchInstalledMaps(target TargetServer) ([]MapInfo, error) {
 	}
 	defer func() { _ = conn.Close() }()
 
+	workshopMapNames := make(map[string]bool)
+	if wsResp, err := conn.Execute("ds_workshop_listmaps"); err == nil {
+		if debugMode {
+			log.Printf("[DEBUG] 'ds_workshop_listmaps' response from %s:\n%s", target.Name, wsResp)
+		}
+		re := regexp.MustCompile(`\(([^)]+)\)`)
+		matches := re.FindAllStringSubmatch(wsResp, -1)
+		for _, m := range matches {
+			workshopMapNames[m[1]] = true
+		}
+	}
+
 	resp, err := conn.Execute("maps *")
 	if err != nil {
 		return nil, err
@@ -174,6 +186,14 @@ func fetchInstalledMaps(target TargetServer) ([]MapInfo, error) {
 				mapName = w[:len(w)-4]
 			}
 
+			// Filter out workshop maps identified by ds_workshop_listmaps
+			if workshopMapNames[mapName] {
+				if debugMode {
+					log.Printf("[DEBUG] Skipping workshop map (from ds_workshop_listmaps): %s", mapName)
+				}
+				continue
+			}
+
 			// Filter out paths (editor/, ui/, prefabs/, etc.) and vanity/background maps
 			if strings.Contains(mapName, "/") || strings.Contains(mapName, "\\") ||
 				strings.HasSuffix(mapName, "_vanity") || strings.HasSuffix(mapName, "_skybox") ||
@@ -190,7 +210,7 @@ func fetchInstalledMaps(target TargetServer) ([]MapInfo, error) {
 				maps = append(maps, MapInfo{ID: mapName, Title: mapName})
 				seen[mapName] = true
 				if debugMode {
-					log.Printf("[DEBUG] Added map: %s", mapName)
+					log.Printf("[DEBUG] Added official map: %s", mapName)
 				}
 			}
 		}
