@@ -6,13 +6,12 @@ services:
     environment:
       PORT: 16969
       #DEBUG: true
+      #WEB_PATH: /cs2/
+      #TRUSTED_ORIGINS: https://homeassistant.example.com
     restart: unless-stopped
     network_mode: host
     secrets:
-      - steam_api_key
       - rcon_targets
 secrets:
   rcon_targets:
     file: secrets/rcon_targets
-  steam_api_key:
-    file: secrets/steam_api_key
