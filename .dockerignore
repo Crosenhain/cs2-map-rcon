@@ -1,0 +1,7 @@
+.git
+.github
+.claude
+secrets
+*.md
+compose.yml
+Dockerfile
