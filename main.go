@@ -451,6 +451,14 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
     .bot-button.danger:hover { background-color: #7a2a2a; border-color: #cc4444; }
     .bot-button.active { background-color: #4caf50; border-color: #4caf50; }
     .bot-button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Kick confirmation modal. */
+    .confirm-dialog { background-color: #2a2a2a; color: #f0f0f0; border: 1px solid #555; border-radius: 8px; padding: 0; width: min(26rem, calc(100vw - 2rem)); }
+    .confirm-dialog::backdrop { background-color: rgba(0, 0, 0, 0.6); }
+    .confirm-dialog form { margin: 0; padding: 1.25rem; }
+    .confirm-dialog h2 { margin: 0 0 0.5rem 0; font-size: 1.1rem; }
+    .confirm-dialog p { margin: 0 0 1.25rem 0; line-height: 1.4; overflow-wrap: anywhere; }
+    .confirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
     .workshop-input, .map-filter { flex: 1 1 auto; min-width: 0; max-width: 22rem; background-color: #2a2a2a; color: #f0f0f0; border: 2px solid #555; border-radius: 8px; padding: 0.6rem 1rem; font-size: 0.95rem; }
     .map-sort { flex: 0 0 auto; background-color: #2f2f2f; color: #fff; border: 2px solid #555; border-radius: 8px; padding: 0.6rem 0.75rem; font-size: 0.95rem; cursor: pointer; }
     .map-sort:hover { border-color: #777; }
@@ -571,6 +579,9 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
       // Don't yank the list out from under the user while it is open/focused;
       // the next poll will catch up once focus moves on.
       if (document.activeElement === select) return;
+      // Likewise hold it still while a kick is waiting on confirmation, so the
+      // form submits exactly the player shown in the dialog.
+      if (pendingKickForm) return;
 
       const list = (Array.isArray(players) ? players : []).filter(function (p) {
         return p && Number.isInteger(p.id) && typeof p.name === 'string';
@@ -609,13 +620,45 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
       nameInput.value = (opt && opt.value !== '') ? (opt.dataset.playerName || '') : '';
     }
 
+    // The kick form waiting on the confirmation dialog, if any.
+    let pendingKickForm = null;
+
+    // Ask before kicking. The form never submits straight from here; the
+    // dialog's close handler submits it only if the user picks Kick.
     function confirmKick(form) {
       const select = form.querySelector('select[name="userid"]');
       if (!select || select.value === '') return false; // placeholder selected: nothing to do
       syncKickName(select);
       const name = form.querySelector('input[name="name"]').value;
       const target = form.querySelector('input[name="target"]').value;
-      return window.confirm('Kick "' + name + '" (#' + select.value + ') from ' + target + '?');
+      const dialog = document.getElementById('kick-dialog');
+      if (!dialog || typeof dialog.showModal !== 'function') {
+        // No <dialog> support: fall back to the browser's own prompt.
+        return window.confirm('Kick "' + name + '" (#' + select.value + ') from ' + target + '?');
+      }
+      const msg = document.getElementById('kick-dialog-msg');
+      msg.textContent = 'Kick ';
+      msg.appendChild(makeEl('strong', '', name || '(no name)'));
+      msg.appendChild(document.createTextNode(' (#' + select.value + ') from ' + target + '?'));
+      pendingKickForm = form;
+      dialog.returnValue = '';
+      dialog.showModal();
+      return false;
+    }
+
+    function initKickDialog() {
+      const dialog = document.getElementById('kick-dialog');
+      if (!dialog || typeof dialog.showModal !== 'function') return;
+      // The form fills the dialog, so a click targeting the dialog itself
+      // landed on the backdrop: treat it as Cancel. Esc closes it the same way.
+      dialog.addEventListener('click', function (e) {
+        if (e.target === dialog) dialog.close('cancel');
+      });
+      dialog.addEventListener('close', function () {
+        const form = pendingKickForm;
+        pendingKickForm = null;
+        if (form && dialog.returnValue === 'confirm') form.submit();
+      });
     }
 
     // Screen Wake Lock: keep the screen on while this page is visible.
@@ -778,6 +821,7 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
     }
 
     window.onload = function () {
+      initKickDialog();
       restoreBotCounts();
       let savedSort = 'order';
       try { savedSort = localStorage.getItem('mapSort') || 'order'; } catch (e) {}
@@ -884,6 +928,17 @@ var tpl = template.Must(template.New("index").Funcs(template.FuncMap{
   </div>
 </div>
 {{end}}
+
+<dialog id="kick-dialog" class="confirm-dialog" aria-labelledby="kick-dialog-title" aria-describedby="kick-dialog-msg">
+  <form method="dialog">
+    <h2 id="kick-dialog-title">Kick player?</h2>
+    <p id="kick-dialog-msg"></p>
+    <div class="confirm-actions">
+      <button class="bot-button" type="submit" value="cancel" autofocus>Cancel</button>
+      <button class="bot-button danger" type="submit" value="confirm">Kick</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>
 `))
